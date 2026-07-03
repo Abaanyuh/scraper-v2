@@ -1,26 +1,22 @@
 """
-Core web-scraping primitives: DuckDuckGo search, page fetching,
-metadata extraction, and polite rate-limiting.
+Core web-scraping primitives: DDG search via ddgs library,
+page fetching, metadata extraction, and polite rate-limiting.
 """
 
 import asyncio
 import re
 import time
-from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 from bs4 import BeautifulSoup
+from ddgs import DDGS
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
-DDG_HTML = "https://html.duckduckgo.com/html/"
 
-# ---------------------------------------------------------------------------
-# Rate limiter
-# ---------------------------------------------------------------------------
 
 class RateLimiter:
     """Ensure at least `delay` seconds between consecutive calls."""
@@ -36,91 +32,31 @@ class RateLimiter:
         self._last = time.monotonic()
 
 
-# ---------------------------------------------------------------------------
-# DuckDuckGo search
-# ---------------------------------------------------------------------------
-
-async def search_ddg(
-    query: str,
-    max_results: int = 10,
-    session: aiohttp.ClientSession | None = None,
-) -> list[dict]:
+def search_ddg(query: str, max_results: int = 10) -> list[dict]:
     """
-    Search DuckDuckGo's HTML (non-JS) endpoint.
-
-    Returns a list of dicts: {title, url, snippet}.
+    Search DuckDuckGo via ddgs library.
+    Returns list of {title, url, snippet}.
+    Synchronous — run in executor if needed.
     """
-    close = False
-    if session is None:
-        session = aiohttp.ClientSession(
-            headers={"User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=20),
-        )
-        close = True
-
     try:
-        async with session.get(DDG_HTML, params={"q": query}) as resp:
-            if resp.status != 200:
-                return []
-            html = await resp.text()
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=max_results))
+        return [
+            {"title": r["title"], "url": r["href"], "snippet": r.get("body", "")}
+            for r in raw
+        ]
     except Exception as exc:
         print(f"  [!] DDG search failed: {exc}")
         return []
-    finally:
-        if close:
-            await session.close()
-
-    soup = BeautifulSoup(html, "html.parser")
-    results: list[dict] = []
-
-    for item in soup.select(".result"):
-        title_el = item.select_one(".result__title a")
-        snippet_el = item.select_one(".result__snippet")
-        if not title_el:
-            continue
-
-        title = title_el.get_text(strip=True)
-        raw_href = title_el.get("href", "")
-        url = _extract_ddg_url(raw_href)
-        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-
-        if url:
-            results.append({"title": title, "url": url, "snippet": snippet})
-
-        if len(results) >= max_results:
-            break
-
-    return results
 
 
-def _extract_ddg_url(href: str) -> str:
-    """DDG wraps result links in a redirect — extract the real target."""
-    from urllib.parse import unquote
-    if "uddg=" in href:
-        try:
-            parsed = urlparse(href, scheme="https")
-            qs_params = parse_qs(parsed.query)
-            if "uddg" in qs_params:
-                return unquote(qs_params["uddg"][0])
-        except Exception:
-            pass
-    return href
-
-
-# ---------------------------------------------------------------------------
-# Page fetching & info extraction
-# ---------------------------------------------------------------------------
-
-async def fetch_page(
-    url: str,
-    session: aiohttp.ClientSession,
-) -> str | None:
+async def fetch_page(url: str, session: aiohttp.ClientSession) -> str | None:
     """Download a page; return HTML text or None on failure."""
     try:
         async with session.get(
             url,
             headers={"User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=12),
             allow_redirects=True,
         ) as resp:
             if resp.status == 200:
@@ -133,56 +69,39 @@ async def fetch_page(
 
 
 async def extract_page_info(html: str | None, url: str) -> dict:
-    """
-    Pull company metadata from a page's HTML.
-
-    Returns {name, description, industry_hint, emails, has_careers}.
-    """
-    result = {
-        "name": urlparse(url).netloc.replace("www.", ""),
-        "description": "",
-        "industry_hint": "",
-        "emails": [],
-        "has_careers": False,
-    }
+    """Pull metadata from a page's HTML. Returns {description, emails, has_careers}."""
+    result = {"description": "", "emails": [], "has_careers": False}
     if not html:
         return result
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # -- title --
-    title = ""
-    if soup.title:
-        title = soup.title.get_text(strip=True)
-    result["name"] = title[:120] if title else result["name"]
-
-    # -- meta description --
     meta = soup.find("meta", attrs={"name": "description"})
     if meta and meta.get("content"):
-        result["description"] = meta["content"][:400]
+        desc = meta["content"].strip()
+        if len(desc) > 10:
+            result["description"] = desc[:400]
 
-    # -- industry hint from meta keywords --
-    kw = soup.find("meta", attrs={"name": "keywords"})
-    if kw and kw.get("content"):
-        result["industry_hint"] = kw["content"][:200]
-
-    # -- emails --
     raw_emails = re.findall(
-        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", html
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}", html
     )
     generic = {
         "support", "info", "admin", "contact", "sales", "billing",
         "hello", "noreply", "no-reply", "webmaster", "postmaster",
     }
-    unique: list[str] = []
+    unique = []
     for e in raw_emails:
-        if e.split("@")[0].lower() not in generic and e not in unique:
-            unique.append(e)
+        prefix = e.split("@")[0].lower()
+        if prefix not in generic and e not in unique:
+            if not re.search(r"[;&<>#]", e) and not e.endswith("."):
+                if "u003" not in e and "u002" not in e:
+                    tld = e.split(".")[-1]
+                    if len(tld) >= 2 and tld.isalpha():
+                        unique.append(e)
         if len(unique) >= 5:
             break
     result["emails"] = unique
 
-    # -- hiring signal --
     career_words = {"career", "hiring", "job", "join", "vacanc", "work with us"}
     for a_tag in soup.find_all("a", href=True):
         text = a_tag.get_text(strip=True).lower()

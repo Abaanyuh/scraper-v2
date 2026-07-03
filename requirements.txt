@@ -3,3 +3,4 @@ openpyxl>=3.1
 aiohttp>=3.9
 beautifulsoup4>=4.12
 tqdm>=4.66
+ddgs>=9.0

@@ -1,10 +1,14 @@
+
 """
-Company discovery via DuckDuckGo search + per-page enrichment.
+Company discovery via DDG multi-query search + per-page enrichment.
+Uses ddgs library for reliable search.
 """
 
 import asyncio
 import sqlite3
 import os
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import aiohttp
 
@@ -18,10 +22,6 @@ from .scraper import (
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "discovered.db")
 
-
-# ---------------------------------------------------------------------------
-# Duplicate cache (SQLite)
-# ---------------------------------------------------------------------------
 
 def _init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -45,71 +45,104 @@ def _mark_scraped(url: str):
 
 
 def clear_cache():
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    p = Path(DB_PATH)
+    if p.exists():
+        p.unlink()
 
 
-# ---------------------------------------------------------------------------
-# Discovery run
-# ---------------------------------------------------------------------------
+def _build_queries(keyword: str, n: int) -> list:
+    per_query = max(4, n // 2)
+    return [
+        (f'"{keyword}" company', per_query),
+        (f"{keyword} company website", per_query),
+    ]
 
-async def run_company_discovery(query: str, max_results: int) -> list[dict]:
-    """
-    Search DuckDuckGo for *query*, visit each result page, and extract
-    company metadata + contact emails.
-    """
+
+async def run_company_discovery(query: str, max_results: int) -> list:
     _init_db()
-    limiter = RateLimiter(delay=2.0)
+    limiter = RateLimiter(delay=3.0)
+    executor = ThreadPoolExecutor(max_workers=1)
+    queries = _build_queries(query, max_results)
+    seen_urls = set()
+    all_results = []
+
+    for q, n in queries:
+        await limiter.wait()
+        print(f"  Searching: {q}")
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(executor, lambda q=q, n=n: search_ddg(q, n))
+        for r in results:
+            if r["url"] not in seen_urls and len(all_results) < max_results:
+                seen_urls.add(r["url"])
+                all_results.append(r)
+        if len(all_results) >= max_results:
+            break
+
+    executor.shutdown(wait=False)
+    print(f"  Found {len(all_results)} unique results.")
+
+    if not all_results:
+        return []
 
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
         timeout=aiohttp.ClientTimeout(total=20),
     ) as session:
 
-        # Step 1 — search
-        print(f"  Searching DDG for '{query}' …")
-        search_results = await search_ddg(query, max_results, session)
-        print(f"  Found {len(search_results)} results.")
-
-        if not search_results:
-            return []
-
-        # Step 2 — enrich each company
-        companies: list[dict] = []
-        for i, sr in enumerate(search_results, 1):
+        companies = []
+        for i, sr in enumerate(all_results, 1):
             url = sr["url"]
             if _is_scraped(url):
-                print(f"  [{i}/{len(search_results)}] SKIP (cached)  {url}")
                 continue
 
-            await limiter.wait()
-            print(f"  [{i}/{len(search_results)}] Fetching {url[:80]} …")
-            html = await fetch_page(url, session)
+            company_name = _clean_company_name(sr["title"])
+            ddg_desc = sr["snippet"]
 
+            await limiter.wait()
+            print(f"  [{i}/{len(all_results)}] {company_name[:50]}")
+            html = await fetch_page(url, session)
             info = await extract_page_info(html, url)
-            company = {
+
+            description = info.get("description", "") or ddg_desc
+            hiring = "Yes" if info["has_careers"] else _hiring_from_snippet(ddg_desc)
+            size = _guess_size(ddg_desc + " " + description)
+
+            companies.append({
                 "url": url,
-                "name": info["name"],
-                "description": info.get("description", sr.get("snippet", "")),
+                "name": company_name,
+                "description": description,
                 "industry": query,
-                "industry_hint": info.get("industry_hint", ""),
-                "size": _guess_size(info),
-                "hiring_signals": "Yes" if info["has_careers"] else "No",
+                "size": size,
+                "hiring_signals": hiring,
                 "contacts": info["emails"],
-            }
-            companies.append(company)
+            })
             _mark_scraped(url)
 
         return companies
 
 
-def _guess_size(info: dict) -> str:
-    """Crude heuristic — not reliable, but better than hardcoded 'Mid'."""
-    desc = (info.get("description", "") + " " + info.get("industry_hint", "")).lower()
-    large_words = {"enterprise", "global", "fortune", "multinational", "1000+"}
-    small_words = {"startup", "small business", "boutique", "freelance", "solo"}
-    if any(w in desc for w in large_words):
+def _clean_company_name(title: str) -> str:
+    for s in [" - Wikipedia", " | LinkedIn", " - Crunchbase", " - Home"]:
+        if s in title:
+            title = title.split(s)[0]
+    for sep in [" | ", " - "]:
+        if len(title.split(sep)[0]) > 10:
+            title = title.split(sep)[0]
+    return title.strip()[:120]
+
+
+def _hiring_from_snippet(text: str) -> str:
+    signals = ["hiring", "career", "job opening", "join our team",
+               "we're hiring", "now hiring", "vacancy", "apply now"]
+    if any(s in text.lower() for s in signals):
+        return "Yes (snippet)"
+    return "No"
+
+
+def _guess_size(text: str) -> str:
+    t = text.lower()
+    if any(w in t for w in ["enterprise", "global", "fortune", "multinational"]):
         return "Large"
-    if any(w in desc for w in small_words):
+    if any(w in t for w in ["startup", "small business", "boutique", "early-stage", "seed"]):
         return "Small"
     return "Mid"

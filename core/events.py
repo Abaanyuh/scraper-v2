@@ -1,9 +1,10 @@
+
 """
-Networking event discovery — search DuckDuckGo for city‑specific
-business mixers and flag results that mention refreshments.
+Networking event discovery via DuckDuckGo with refreshment signal detection.
 """
 
 import asyncio
+import re
 
 import aiohttp
 
@@ -13,58 +14,63 @@ REFRESHMENT_KEYWORDS = [
     "refreshment", "networking drinks", "high tea", "buffet",
     "dinner included", "happy hour", "hors d'oeuvres", "cocktail",
     "catered", "open bar", "coffee break", "lunch provided",
-    "breakfast included", "wine", "canapés", "finger food",
+    "breakfast included", "wine", "canap\u00e9s", "finger food",
 ]
 
 
-async def scrape_networking_events(city: str, max_results: int) -> list[dict]:
-    """
-    Search DDG for networking events in *city* and flag refreshment signals.
-    """
+async def scrape_networking_events(city: str, max_results: int) -> list:
     limiter = RateLimiter(delay=2.5)
-    query = f"{city} networking events business mixer"
+    queries = [
+        f"{city} networking events mixer",
+        f"{city} business networking meetup",
+        f"{city} professional networking conference",
+    ]
+    per_query = max(3, max_results // 3)
+    seen = set()
+    all_results = []
 
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
         timeout=aiohttp.ClientTimeout(total=20),
     ) as session:
 
-        await limiter.wait()
-        print(f"  Searching for events in {city} …")
-        results = await search_ddg(query, max_results * 2, session)
+        for q in queries:
+            await limiter.wait()
+            print(f"  Searching: {q}")
+            results = await search_ddg(q, per_query, session)
+            for r in results:
+                if r["url"] not in seen and len(all_results) < max_results:
+                    seen.add(r["url"])
+                    all_results.append(r)
+            if len(all_results) >= max_results:
+                break
 
-        events: list[dict] = []
-        for sr in results:
-            title = sr["title"]
-            snippet = sr.get("snippet", "")
-            combined = (title + " " + snippet).lower()
+        print(f"  Found {len(all_results)} event listings.")
+        events = []
 
-            refreshment_signal = "None detected"
+        for sr in all_results:
+            combined = (sr["title"] + " " + sr["snippet"]).lower()
+            signal = "None detected"
             for kw in REFRESHMENT_KEYWORDS:
                 if kw in combined:
-                    refreshment_signal = f"✅ Mentions '{kw}'"
+                    signal = f"Mentions '{kw}'"
                     break
 
             events.append({
-                "name": title,
+                "name": sr["title"],
                 "venue": city,
-                "date": _guess_date(snippet),
+                "date": _guess_date(sr["snippet"]),
                 "url": sr["url"],
-                "refreshment_signal": refreshment_signal,
+                "refreshment_signal": signal,
+                "description": sr["snippet"],
             })
-
-            if len(events) >= max_results:
-                break
 
         return events
 
 
 def _guess_date(text: str) -> str:
-    """Try to pull a date-like string from a snippet."""
-    import re
-
     patterns = [
-        r"\b\d{4}-\d{2}-\d{2}\b",                         # 2026-08-15
+        r"\b\d{4}-\d{2}-\d{2}\b",
         r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b",
         r"\b\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4}\b",
     ]
