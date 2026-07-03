@@ -1,7 +1,5 @@
-
 """
 Company discovery via DDG multi-query search + per-page enrichment.
-Uses ddgs library for reliable search.
 """
 
 import asyncio
@@ -19,6 +17,7 @@ from .scraper import (
     fetch_page,
     extract_page_info,
 )
+
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "discovered.db")
 
@@ -45,16 +44,18 @@ def _mark_scraped(url: str):
 
 
 def clear_cache():
-    p = Path(DB_PATH)
-    if p.exists():
-        p.unlink()
+    try:
+        os.unlink(DB_PATH)
+    except FileNotFoundError:
+        pass
 
 
 def _build_queries(keyword: str, n: int) -> list:
-    per_query = max(4, n // 2)
+    per_query = max(5, n // 3)
     return [
-        (f'"{keyword}" company', per_query),
-        (f"{keyword} company website", per_query),
+        (f"{keyword} company contact email", per_query),
+        (f"{keyword} company | about us", per_query),
+        (f"{keyword} solutions services pricing", per_query),
     ]
 
 
@@ -79,8 +80,7 @@ async def run_company_discovery(query: str, max_results: int) -> list:
             break
 
     executor.shutdown(wait=False)
-    print(f"  Found {len(all_results)} unique results.")
-
+    print(f"  Found {len(all_results)} unique leads.")
     if not all_results:
         return []
 
@@ -99,7 +99,7 @@ async def run_company_discovery(query: str, max_results: int) -> list:
             ddg_desc = sr["snippet"]
 
             await limiter.wait()
-            print(f"  [{i}/{len(all_results)}] {company_name[:50]}")
+            print(f"  [{i}/{len(all_results)}] Enriching: {company_name[:50]}")
             html = await fetch_page(url, session)
             info = await extract_page_info(html, url)
 
@@ -122,7 +122,8 @@ async def run_company_discovery(query: str, max_results: int) -> list:
 
 
 def _clean_company_name(title: str) -> str:
-    for s in [" - Wikipedia", " | LinkedIn", " - Crunchbase", " - Home"]:
+    for s in [" - Wikipedia", " | LinkedIn", " - Crunchbase", " - Home",
+               " | Facebook", " - YouTube"]:
         if s in title:
             title = title.split(s)[0]
     for sep in [" | ", " - "]:
