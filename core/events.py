@@ -1,10 +1,11 @@
 
 """
-Networking event discovery via DuckDuckGo with refreshment signal detection.
+Networking event discovery via DDG with refreshment signal detection.
 """
 
 import asyncio
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 
@@ -23,49 +24,46 @@ async def scrape_networking_events(city: str, max_results: int) -> list:
     queries = [
         f"{city} networking events mixer",
         f"{city} business networking meetup",
-        f"{city} professional networking conference",
     ]
-    per_query = max(3, max_results // 3)
+    executor = ThreadPoolExecutor(max_workers=1)
+    per_query = max(4, max_results // 2)
     seen = set()
     all_results = []
 
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": USER_AGENT},
-        timeout=aiohttp.ClientTimeout(total=20),
-    ) as session:
+    loop = asyncio.get_event_loop()
+    for q in queries:
+        await limiter.wait()
+        print(f"  Searching: {q}")
+        results = await loop.run_in_executor(executor, lambda q=q: search_ddg(q, per_query))
+        for r in results:
+            if r["url"] not in seen and len(all_results) < max_results:
+                seen.add(r["url"])
+                all_results.append(r)
+        if len(all_results) >= max_results:
+            break
 
-        for q in queries:
-            await limiter.wait()
-            print(f"  Searching: {q}")
-            results = await search_ddg(q, per_query, session)
-            for r in results:
-                if r["url"] not in seen and len(all_results) < max_results:
-                    seen.add(r["url"])
-                    all_results.append(r)
-            if len(all_results) >= max_results:
+    executor.shutdown(wait=False)
+    print(f"  Found {len(all_results)} event listings.")
+    events = []
+
+    for sr in all_results:
+        combined = (sr["title"] + " " + sr["snippet"]).lower()
+        signal = "None detected"
+        for kw in REFRESHMENT_KEYWORDS:
+            if kw in combined:
+                signal = f"Mentions '{kw}'"
                 break
 
-        print(f"  Found {len(all_results)} event listings.")
-        events = []
+        events.append({
+            "name": sr["title"],
+            "venue": city,
+            "date": _guess_date(sr["snippet"]),
+            "url": sr["url"],
+            "refreshment_signal": signal,
+            "description": sr["snippet"],
+        })
 
-        for sr in all_results:
-            combined = (sr["title"] + " " + sr["snippet"]).lower()
-            signal = "None detected"
-            for kw in REFRESHMENT_KEYWORDS:
-                if kw in combined:
-                    signal = f"Mentions '{kw}'"
-                    break
-
-            events.append({
-                "name": sr["title"],
-                "venue": city,
-                "date": _guess_date(sr["snippet"]),
-                "url": sr["url"],
-                "refreshment_signal": signal,
-                "description": sr["snippet"],
-            })
-
-        return events
+    return events
 
 
 def _guess_date(text: str) -> str:
