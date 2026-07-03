@@ -1,0 +1,17 @@
+[project]
+name = "lead-discovery-platform"
+version = "2.0.0"
+description = "CLI web scraper for company discovery and networking event finding with Excel export"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "rich>=13.0",
+    "openpyxl>=3.1",
+    "aiohttp>=3.9",
+    "beautifulsoup4>=4.12",
+    "tqdm>=4.66",
+]
+
+[project.scripts]
+discovery = "main:main_loop"
